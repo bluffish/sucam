@@ -2,6 +2,7 @@ import os
 import random
 import warnings
 
+import numpy as np
 import torch
 import torchvision
 
@@ -9,36 +10,15 @@ from nuscenes.eval.common.utils import quaternion_yaw
 from nuscenes.map_expansion.map_api import NuScenesMap
 from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.splits import create_splits_scenes
-from nuscenes.utils.geometry_utils import view_points, transform_matrix
-from nuscenes.utils.data_classes import Box, LidarPointCloud
+from nuscenes.utils.geometry_utils import transform_matrix
+from nuscenes.utils.data_classes import LidarPointCloud
 from functools import reduce
-from nuscenes.utils.data_io import load_bin_file
+from nuscenes.utils.geometry_utils import view_points
 
 from shapely.errors import ShapelyDeprecationWarning
-
 from tools.geometry import *
 
 warnings.filterwarnings("ignore", category=ShapelyDeprecationWarning)
-
-
-def ego_to_cam(points, rot, trans, intrins):
-    """Transform points (3 x N) from ego frame into a pinhole camera
-    """
-    points = points - trans.unsqueeze(1)
-    points = rot.permute(1, 0).matmul(points)
-
-    points = intrins.matmul(points)
-    points[:2] /= points[2:3]
-
-    return points
-
-
-def get_only_in_img_mask(pts, H, W):
-    """pts should be 3 x N
-    """
-    return (pts[2] > 0) &\
-        (pts[0] > 1) & (pts[0] < W - 1) &\
-        (pts[1] > 1) & (pts[1] < H - 1)
 
 
 def get_lidar_data(nusc, sample_rec, nsweeps, min_distance):
@@ -58,22 +38,21 @@ def get_lidar_data(nusc, sample_rec, nsweeps, min_distance):
 
     # Homogeneous transformation matrix from global to _current_ ego car frame.
     car_from_global = transform_matrix(ref_pose_rec['translation'], Quaternion(ref_pose_rec['rotation']),
-                                        inverse=True)
+                                       inverse=True)
 
     # Aggregate current and previous sweeps.
     sample_data_token = sample_rec['data']['LIDAR_TOP']
     current_sd_rec = nusc.get('sample_data', sample_data_token)
+
     for _ in range(nsweeps):
         # Load up the pointcloud and remove points close to the sensor.
         current_pc = LidarPointCloud.from_file(os.path.join(nusc.dataroot, current_sd_rec['filename']))
-        points_label = np.fromfile(os.path.join(nusc.dataroot, current_sd_rec['filename']), dtype=np.uint8)
-
         current_pc.remove_close(min_distance)
 
         # Get past pose.
         current_pose_rec = nusc.get('ego_pose', current_sd_rec['ego_pose_token'])
         global_from_car = transform_matrix(current_pose_rec['translation'],
-                                            Quaternion(current_pose_rec['rotation']), inverse=False)
+                                           Quaternion(current_pose_rec['rotation']), inverse=False)
 
         # Homogeneous transformation matrix from sensor coordinate frame to ego car frame.
         current_cs_rec = nusc.get('calibrated_sensor', current_sd_rec['calibrated_sensor_token'])
@@ -99,18 +78,23 @@ def get_lidar_data(nusc, sample_rec, nsweeps, min_distance):
 
     return points
 
+
+class NormalizeInverse(torchvision.transforms.Normalize):
+    #  https://discuss.pytorch.org/t/simple-way-to-inverse-transform-normalization/4821/8
+    def __init__(self, mean, std):
+        mean = torch.as_tensor(mean)
+        std = torch.as_tensor(std)
+        std_inv = 1 / (std + 1e-7)
+        mean_inv = -mean * std_inv
+        super().__init__(mean=mean_inv, std=std_inv)
+
+    def __call__(self, tensor):
+        return super().__call__(tensor.clone())
+
+
 class NuScenesDataset(torch.utils.data.Dataset):
-    def __init__(self, nusc, is_train, pos_class, ind=False, ood=False, pseudo=False, yaw=180):
-        self.ind = ind
-        self.ood = ood
-        self.pseudo = pseudo
+    def __init__(self, nusc, is_train, pos_class):
         self.pos_class = pos_class
-        self.yaw = yaw
-
-        self.pseudo_ood = ["vehicle.bicycle", "static_object.bicycle_rack"]
-        self.true_ood = ["vehicle.motorcycle"]
-
-        self.all_ood = self.true_ood + self.pseudo_ood
 
         self.nusc = nusc
         self.is_train = is_train
@@ -121,6 +105,7 @@ class NuScenesDataset(torch.utils.data.Dataset):
 
         self.scenes = self.get_scenes()
         self.ixes = self.prepro()
+        self.gen_labels = False
 
         self.maps = {map_name: NuScenesMap(dataroot=self.dataroot, map_name=map_name) for map_name in [
             "singapore-hollandvillage",
@@ -130,8 +115,6 @@ class NuScenesDataset(torch.utils.data.Dataset):
         ]}
 
         self.augmentation_parameters = self.get_resizing_and_cropping_parameters()
-
-        self.to_tensor = torchvision.transforms.Compose([torchvision.transforms.ToTensor()])
 
         bev_resolution, bev_start_position, bev_dimension = calculate_birds_eye_view_parameters(
             [-50.0, 50.0, 0.5], [-50.0, 50.0, 0.5], [-10.0, 10.0, 20.0]
@@ -148,6 +131,18 @@ class NuScenesDataset(torch.utils.data.Dataset):
             log = nusc.get('log', rec['log_token'])
             self.sm[rec['name']] = log['location']
 
+        self.normalise_image = torchvision.transforms.Compose(
+            [torchvision.transforms.ToTensor(),
+             torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]
+        )
+
+        self.denormalize_image = torchvision.transforms.Compose(
+            (
+                NormalizeInverse(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                torchvision.transforms.ToPILImage(),
+            )
+        )
+
     def get_scenes(self):
         split = {'v1.0-trainval': {True: 'train', False: 'val'},
                  'v1.0-mini': {True: 'mini_train', False: 'mini_val'}, }[
@@ -161,41 +156,10 @@ class NuScenesDataset(torch.utils.data.Dataset):
     def prepro(self):
         samples = [samp for samp in self.nusc.sample]
         samples = [samp for samp in samples if self.nusc.get('scene', samp['scene_token'])['name'] in self.scenes]
+
         samples.sort(key=lambda x: (x['scene_token'], x['timestamp']))
 
-        records = []
-
-        for rec in samples:
-            ego_pose = self.nusc.get('ego_pose', rec['data']['LIDAR_TOP'])
-
-            ego_coord = ego_pose['translation']
-
-            is_true_ood = False
-            is_pseudo_ood = False
-
-            for tok in rec['anns']:
-                inst = self.nusc.get('sample_annotation', tok)
-
-                box_coord = inst['translation']
-
-                if max(abs(ego_coord[0] - box_coord[0]), abs(ego_coord[1] - box_coord[1])) > 50 or int(
-                        inst['visibility_token']) <= 2:
-                    continue
-
-                if inst['category_name'] in self.true_ood:
-                    is_true_ood = True
-
-                if inst['category_name'] in self.pseudo_ood:
-                    is_pseudo_ood = True
-
-            if self.ind and not is_pseudo_ood and not is_true_ood:
-                records.append(rec)
-            if self.ood and is_true_ood:
-                records.append(rec)
-            if self.pseudo and is_pseudo_ood:
-                records.append(rec)
-
-        return records
+        return samples
 
     @staticmethod
     def get_resizing_and_cropping_parameters():
@@ -217,21 +181,21 @@ class NuScenesDataset(torch.utils.data.Dataset):
 
     def get_lidar_data(self, rec, nsweeps):
         pts = get_lidar_data(self.nusc, rec,
-                             nsweeps=nsweeps, min_distance=2.2)
+                             nsweeps=nsweeps, min_distance=0)
         return torch.Tensor(pts)[:3]
 
     def get_input_data(self, rec):
         images = []
+        segs = []
+        deps = []
         intrinsics = []
         extrinsics = []
-        depths = []
-        segs = []
 
-        points = self.get_lidar_data(rec, nsweeps=5)
-
-        # panoptic_file = os.path.join(self.nusc.dataroot,
-        #                                     self.nusc.get('panoptic', rec['data']['LIDAR_TOP'])['filename'])
-        # points_label = np.fromfile(panoptic_file, dtype=np.uint8)
+        if self.gen_labels:
+            points = self.get_lidar_data(rec, nsweeps=1)
+            lidarseg_file = os.path.join(self.nusc.dataroot,
+                                          self.nusc.get('lidarseg', rec['data']['LIDAR_TOP'])['filename'])
+            points_label = np.fromfile(lidarseg_file, dtype=np.uint8)
 
         for cam in self.cameras:
             camera_sample = self.nusc.get('sample_data', rec['data'][cam])
@@ -241,9 +205,7 @@ class NuScenesDataset(torch.utils.data.Dataset):
 
             q = sensor_sample['rotation']
 
-            adjust_yaw = Rotation.from_euler('z', [self.yaw], degrees=True)
-            sensor_rotation = Rotation.from_quat([q[1], q[2], q[3], q[0]]).inv() * adjust_yaw
-
+            sensor_rotation = Rotation.from_quat([q[1], q[2], q[3], q[0]]).inv()
             sensor_translation = np.array(sensor_sample['translation'])
 
             extrinsic = np.eye(4, dtype=np.float32)
@@ -255,7 +217,7 @@ class NuScenesDataset(torch.utils.data.Dataset):
 
             image = resize_and_crop_image(image, resize_dims=self.augmentation_parameters['resize_dims'],
                                           crop=self.augmentation_parameters['crop'])
-            normalized_image = self.to_tensor(image)
+            normalized_image = self.normalise_image(image)
 
             top_crop = self.augmentation_parameters['crop'][1]
             left_crop = self.augmentation_parameters['crop'][0]
@@ -266,30 +228,60 @@ class NuScenesDataset(torch.utils.data.Dataset):
                 scale_height=self.augmentation_parameters['scale_height']
             )
 
-            cam_points = ego_to_cam(points,
-                                 torch.Tensor(Quaternion(sensor_sample['rotation']).rotation_matrix),
-                                 torch.Tensor(sensor_sample['translation']), intrinsic)
-            mask = get_only_in_img_mask(cam_points, 224, 480)
-            cam_points = cam_points[:, mask]
+            w, h = 60, 28
+            ub, lb, intv = 58, 2, 2
+            bins = (ub - lb) * intv
 
-            w, h = 30, 14
-            depth = np.zeros((h, w))
-            depth.fill(40)
+            if self.gen_labels:
+                cam_points = ego_to_cam(points,
+                                        torch.Tensor(Quaternion(sensor_sample['rotation']).rotation_matrix),
+                                        torch.Tensor(sensor_sample['translation']), intrinsic)
+                mask = get_only_in_img_mask(cam_points, 224, 480)
+                cam_points = cam_points[:, mask].numpy()
+                cam_points_label = points_label[mask]
 
-            for i in range(cam_points.shape[1]):
-                yco = int(cam_points[0, i] // (224 // h))
-                xco = int(cam_points[1, i] // (480 // w))
+                depth = np.full((h, w), bins, dtype=float)
 
-                depth[xco, yco] = min(cam_points[2, i], depth[xco][yco])
+                yco = (cam_points[0] // (224 // h)).astype(int)
+                xco = (cam_points[1] // (480 // w)).astype(int)
+                indices = (xco, yco)
 
-            depths.append(torch.tensor(depth))
+                depth_updates = cam_points[2] * intv - lb * intv
+                np.minimum.at(depth, indices, depth_updates)
+
+                seg = np.full((h, w), 2)
+
+                positive = np.isin(cam_points_label, [16, 17, 23])
+                seg[xco[~positive], yco[~positive]] = 0
+                seg[xco[positive], yco[positive]] = 1
+
+                depth = np.floor(depth)
+                depth[depth < 0] = bins
+                depth = depth.astype(np.uint8)
+
+                cv2.imwrite(os.path.join(self.dataroot, f"gen_labels/{rec['data'][cam]}.png"), np.stack([depth, seg, np.zeros_like(depth)], axis=2).astype(np.uint8))
+            
+                depth = torch.tensor(depth).long()
+                seg = torch.tensor(seg).long()
+            else:
+                ds = cv2.imread(os.path.join(self.dataroot, f"gen_labels/{rec['data'][cam]}.png"))
+
+                depth = torch.tensor(ds[:, :, 0]).long()
+                seg = torch.tensor(ds[:, :, 1]).long()
+
+                depth[depth == bins] = -1
+
             images.append(normalized_image)
+            deps.append(depth)
+            segs.append(seg)
+            # deps.append(torch.ones(1, 1))
+            # segs.append(torch.ones(1, 1))
             intrinsics.append(intrinsic)
             extrinsics.append(torch.tensor(extrinsic))
 
         return (torch.stack(images, dim=0),
-                torch.ones((1, 1)),
-                torch.stack(depths, dim=0),
+                torch.stack(segs, dim=0),
+                torch.stack(deps, dim=0),
                 torch.stack(intrinsics, dim=0),
                 torch.stack(extrinsics, dim=0))
 
@@ -301,51 +293,25 @@ class NuScenesDataset(torch.utils.data.Dataset):
         return trans, rot
 
     def get_label(self, rec):
-        egopose = self.nusc.get('ego_pose',
-                                self.nusc.get('sample_data', rec['data']['LIDAR_TOP'])['ego_pose_token'])
-
-        trans = -np.array(egopose['translation'])
-        rot = Quaternion(egopose['rotation']).inverse
-
-        vehicles = np.zeros(self.bev_dimension[:2])
-        ood = np.zeros(self.bev_dimension[:2])
-
-        for token in rec['anns']:
-            inst = self.nusc.get('sample_annotation', token)
-
-            if int(inst['visibility_token']) == 1:
-                continue
-
-            if inst['category_name'] in self.all_ood:
-                pts, _ = self.get_region(inst, trans, rot)
-                cv2.fillPoly(ood, [pts], 1.0)
-            elif 'vehicle' in inst['category_name']:
-                pts, _ = self.get_region(inst, trans, rot)
-                cv2.fillPoly(vehicles, [pts], 1.0)
-
-        road, lane = self.get_map(rec)
-        empty = np.ones(self.bev_dimension[:2])
+        trans, rot = self._get_top_lidar_pose(rec)
 
         if self.pos_class == 'vehicle':
-            empty[vehicles == 1] = 0
-            label = np.stack((vehicles, empty))
-        elif self.pos_class == 'road':
-            empty[road == 1] = 0
-            label = np.stack((road, empty))
-        elif self.pos_class == 'lane':
-            empty[lane == 1] = 0
-            label = np.stack((lane, empty))
-        elif self.pos_class == 'all':
-            empty[vehicles == 1] = 0
-            empty[lane == 1] = 0
-            empty[road == 1] = 0
+            vehicles = np.zeros(self.bev_dimension[:2])
 
-            road[vehicles == 1] = 0
-            road[lane == 1] = 0
-            lane[vehicles == 1] = 0
-            label = np.stack((vehicles, road, lane, empty))
+            for token in rec['anns']:
+                inst = self.nusc.get('sample_annotation', token)
 
-        return torch.tensor(label.copy()), torch.tensor(ood[None])
+                if int(inst['visibility_token']) == 1:
+                    continue
+                elif 'vehicle' in inst['category_name']:
+                    pts, _ = self.get_region(inst, trans, rot)
+                    cv2.fillPoly(vehicles, [pts], 1.0)
+
+            return vehicles
+        elif self.pos_class == 'driveable':
+            road, lane = self.get_map(rec)
+
+            return road | lane
 
     def get_region(self, instance_annotation, ego_translation, ego_rotation):
         box = Box(instance_annotation['translation'], instance_annotation['size'],
@@ -385,9 +351,9 @@ class NuScenesDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         rec = self.ixes[index]
         images, segs, depths, intrinsics, extrinsics = self.get_input_data(rec)
-        labels, oods = self.get_label(rec)
+        labels = self.get_label(rec)
 
-        return images, segs, depths, intrinsics, extrinsics, labels, oods
+        return images, segs, depths, intrinsics, extrinsics, labels[None]
 
 
 def get_nusc(version, dataroot):
@@ -397,62 +363,20 @@ def get_nusc(version, dataroot):
     return nusc, dataroot
 
 
-def compile_data(set, version, dataroot, pos_class, batch_size=8, num_workers=16, seed=0, is_train=False, yaw=180):
-    if set == "train":
-        ind, ood, pseudo, is_train = True, False, False, True
-    elif set == "val":
-        ind, ood, pseudo, is_train = True, False, False, False
-    elif set == "train_aug":
-        ind, ood, pseudo, is_train = False, False, True, True
-    elif set == "val_aug":
-        ind, ood, pseudo, is_train = False, False, True, False
-    elif set == "train_comb":
-        ind, ood, pseudo, is_train = True, False, True, True
-    elif set == "val_comb":
-        ind, ood, pseudo, is_train = True, False, True, False
-    elif set == "train_full":
-        ind, ood, pseudo, is_train = True, True, True, True
-    elif set == "val_full":
-        ind, ood, pseudo, is_train = True, True, True, False
-    elif set == "ood":
-        ind, ood, pseudo, is_train = False, True, False, False
-    elif set == "test":
-        ind, ood, pseudo, is_train = True, False, False, False
-    elif set == "ood_test":
-        ind, ood, pseudo, is_train = True, True, False, False
-    else:
-        raise NotImplementedError(f"Dataset {set} not exist.")
+def compile_data(is_train, version, dataroot, pos_class, batch_size=8, num_workers=16, seed=0, drop_last=True):
+    nusc, dataroot = get_nusc(version, dataroot)
+    data = NuScenesDataset(nusc, is_train, pos_class)
 
-    nusc, dataroot = get_nusc("trainval", dataroot)
-
-    data = NuScenesDataset(nusc, is_train, pos_class, ind=ind, ood=ood, pseudo=pseudo, yaw=yaw)
     random.seed(seed)
     torch.cuda.manual_seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    if version == 'mini':
-        g = torch.Generator()
-        g.manual_seed(seed)
-
-        sampler = torch.utils.data.RandomSampler(data, num_samples=256, generator=g)
-
-        loader = torch.utils.data.DataLoader(
-            data,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            drop_last=True,
-            sampler=sampler,
-            pin_memory=True,
-        )
-    else:
-        loader = torch.utils.data.DataLoader(
-            data,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            shuffle=True,
-            drop_last=True,
-            pin_memory=True
-        )
-
-    return loader
+    return torch.utils.data.DataLoader(
+        data,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle=True,
+        drop_last=drop_last,
+        pin_memory=True
+    )

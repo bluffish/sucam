@@ -6,12 +6,12 @@ __pycache__/
 **/.ipynb_checkpoints/
 notebooks/outputs
 
-nuscenes
-carla
+build
+mmdet3d.egg-info
 venv
 outputs
-outputs_bin
 test
+trash
 
 *.npy
 *.pt

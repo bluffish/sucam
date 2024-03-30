@@ -4,6 +4,7 @@ import torch.nn as nn
 
 from models.backbones.fiery.decoder import Decoder
 from models.backbones.fiery.encoder import Encoder
+from models.backbones.sucam.bev_pool.bev_pool import bev_pool
 from tools.geometry import *
 
 
@@ -36,7 +37,7 @@ class VoxelsSumming(torch.autograd.Function):
 
 
 class Fiery(nn.Module):
-    def __init__(self, n_classes=4):
+    def __init__(self, n_classes=1):
         super().__init__()
 
         bev_resolution, bev_start_position, bev_dimension = calculate_birds_eye_view_parameters(
@@ -46,8 +47,8 @@ class Fiery(nn.Module):
         self.d_bound = [2.0, 50.0, 1.0]
 
         self.bev_resolution = nn.Parameter(torch.tensor(bev_resolution), requires_grad=False)
-        self.bev_start_position = nn.Parameter(torch.tensor(bev_resolution), requires_grad=False)
-        self.bev_dimension = nn.Parameter(torch.tensor(bev_resolution), requires_grad=False)
+        self.bev_start_position = nn.Parameter(torch.tensor(bev_start_position), requires_grad=False)
+        self.bev_dimension = nn.Parameter(torch.tensor(bev_dimension), requires_grad=False)
 
         self.encoder_downsample = 8
         self.encoder_out_channels = 64
@@ -101,15 +102,15 @@ class Fiery(nn.Module):
         b, n, c, h, w = x.shape
 
         x = x.view(b * n, c, h, w)
-        x = self.encoder(x)
+        x, depth = self.encoder(x)
         x = x.view(b, n, *x.shape[1:])
         x = x.permute(0, 1, 3, 4, 5, 2)
 
-        return x
+        return x, depth
 
     def projection_to_birds_eye_view(self, x, geometry):
         batch, n, d, h, w, c = x.shape
-        output = torch.zeros((batch, c, self.bev_dimension[0], self.bev_dimension[1]), dtype=torch.float, device=x.device)
+        output = torch.zeros((batch, c, self.bev_size[0], self.bev_size[1]), dtype=torch.float, device=x.device)
 
         N = n * d * h * w
         for b in range(batch):
@@ -149,6 +150,34 @@ class Fiery(nn.Module):
             output[b] = bev_feature
 
         return output
+
+    def projection_to_birds_eye_view_fast(self, x, geom_feats):
+        B, N, D, H, W, C = x.shape
+        Nprime = B * N * D * H * W
+
+        # flatten x
+        x = x.reshape(Nprime, C)
+
+        # flatten indices
+        geom_feats = ((geom_feats - (self.bev_start_position - self.bev_resolution / 2.)) / self.bev_resolution).long()
+        geom_feats = geom_feats.view(Nprime, 3)
+        batch_ix = torch.cat([torch.full([Nprime // B, 1], ix,
+                                         device=x.device, dtype=torch.long) for ix in range(B)])
+        geom_feats = torch.cat((geom_feats, batch_ix), 1)
+
+        # filter out points that are outside box
+        kept = (geom_feats[:, 0] >= 0) & (geom_feats[:, 0] < self.bev_dimension[0]) \
+               & (geom_feats[:, 1] >= 0) & (geom_feats[:, 1] < self.bev_dimension[1]) \
+               & (geom_feats[:, 2] >= 0) & (geom_feats[:, 2] < self.bev_dimension[2])
+        x = x[kept]
+
+        geom_feats = geom_feats[kept]
+
+        final = bev_pool(x, geom_feats, B, self.bev_dimension[2], self.bev_dimension[0], self.bev_dimension[1])
+
+        final = torch.cat(final.unbind(dim=2), 1)
+
+        return final
 
     def calculate_birds_eye_view_features(self, x, intrinsics, extrinsics):
         geometry = self.get_geometry(intrinsics, extrinsics)

@@ -1,60 +1,99 @@
+from typing import Optional, Sequence
+
 import torch
-import torch.distributions as D
-import torch.nn.functional as F
-from tools.uncertainty import *
-import torch.nn as nn
+from torch import Tensor
+from torch import nn
+from torch.nn import functional as F
 
 
-def ce_loss(logits, target, weights=None):
-    return F.cross_entropy(logits, target, weight=weights, reduction='none')
+class DepthLoss(nn.Module):
+    """ Focal Loss, as described in https://arxiv.org/abs/1708.02002.
 
+    It is essentially an enhancement to cross entropy loss and is
+    useful for classification tasks when there is a large class imbalance.
+    x is expected to contain raw, unnormalized scores for each class.
+    y is expected to contain class labels.
 
-def a_loss(logits, target, weights=None):
-    ce = ce_loss(logits, target, weights=weights)
-    al = entropy(logits)[:, 0, :, :].detach()
+    Shape:
+        - x: (batch_size, C) or (batch_size, C, d1, d2, ..., dK), K > 0.
+        - y: (batch_size,) or (batch_size, d1, d2, ..., dK), K > 0.
+    """
 
-    return ce * al
+    def __init__(self,
+                 alpha: Optional[Tensor] = None,
+                 gamma: float = 0.,
+                 reduction: str = 'mean',
+                 ignore_index: int = -1):
+        """Constructor.
 
+        Args:
+            alpha (Tensor, optional): Weights for each class. Defaults to None.
+            gamma (float, optional): A constant, as described in the paper.
+                Defaults to 0.
+            reduction (str, optional): 'mean', 'sum' or 'none'.
+                Defaults to 'mean'.
+            ignore_index (int, optional): class label to ignore.
+                Defaults to -100.
+        """
+        if reduction not in ('mean', 'sum', 'none'):
+            raise ValueError(
+                'Reduction must be one of: "mean", "sum", "none".')
 
-def compute_scale_and_shift(prediction, target, mask):
-    # system matrix: A = [[a_00, a_01], [a_10, a_11]]
-    a_00 = torch.sum(mask * prediction * prediction, (1, 2))
-    a_01 = torch.sum(mask * prediction, (1, 2))
-    a_11 = torch.sum(mask, (1, 2))
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.ignore_index = ignore_index
+        self.reduction = reduction
 
-    # right hand side: b = [b_0, b_1]
-    b_0 = torch.sum(mask * prediction * target, (1, 2))
-    b_1 = torch.sum(mask * target, (1, 2))
+        self.nll_loss = nn.NLLLoss(
+            weight=alpha, reduction='none', ignore_index=ignore_index)
 
-    # solution: x = A^-1 . b = [[a_11, -a_01], [-a_10, a_00]] / (a_00 * a_11 - a_01 * a_10) . b
-    x_0 = torch.zeros_like(b_0)
-    x_1 = torch.zeros_like(b_1)
+    def __repr__(self):
+        arg_keys = ['alpha', 'gamma', 'ignore_index', 'reduction']
+        arg_vals = [self.__dict__[k] for k in arg_keys]
+        arg_strs = [f'{k}={v!r}' for k, v in zip(arg_keys, arg_vals)]
+        arg_str = ', '.join(arg_strs)
+        return f'{type(self).__name__}({arg_str})'
 
-    det = a_00 * a_11 - a_01 * a_01
-    valid = det.nonzero()
+    def forward(self, x: Tensor, y: Tensor) -> Tensor:
+        if x.ndim > 2:
+            # (N, C, d1, d2, ..., dK) --> (N * d1 * ... * dK, C)
+            c = x.shape[1]
+            x = x.permute(0, *range(2, x.ndim), 1).reshape(-1, c)
+            # (N, d1, d2, ..., dK) --> (N * d1 * ... * dK,)
+            y = y.view(-1)
 
-    x_0[valid] = (a_11[valid] * b_0[valid] - a_01[valid] * b_1[valid]) / det[valid]
-    x_1[valid] = (-a_01[valid] * b_0[valid] + a_00[valid] * b_1[valid]) / det[valid]
+        unignored_mask = y != self.ignore_index
+        y = y[unignored_mask]
+        if len(y) == 0:
+            return torch.tensor(0.)
+        x = x[unignored_mask]
 
-    return x_0, x_1
+        # compute weighted cross entropy term: -alpha * log(pt)
+        # (alpha is already part of self.nll_loss)
+        log_p = x.log()
+        ce = self.nll_loss(log_p, y)
 
+        # get true class column from each row
+        all_rows = torch.arange(len(x))
+        log_pt = log_p[all_rows, y]
 
-def depth_loss(output, target):
-    depth_ratio_map = torch.log(output + 1e-8) - \
-                      torch.log(target + 1e-8)
+        # compute focal term: (1 - pt)^gamma
+        pt = log_pt.exp()
+        focal_term = (1 - pt)**self.gamma
 
-    n = output.shape[-1] * output.shape[-2]
+        # the full loss: -alpha * ((1 - pt)^gamma) * log(pt)
+        loss = focal_term * ce
 
-    loss_1 = torch.sum(depth_ratio_map * depth_ratio_map, dim=(1, 2, 3)) / n
-    sum_2 = torch.sum(depth_ratio_map, dim=(1, 2, 3))
-    loss_2 = sum_2 * sum_2 / n**2
-    return torch.mean(loss_1 + loss_2)
+        if self.reduction == 'mean':
+            loss = loss.mean()
+        elif self.reduction == 'sum':
+            loss = loss.sum()
 
+        return loss
 
-def bce_loss(logits, target, weights=None):
-    return F.binary_cross_entropy_with_logits(logits, target, reduction='none')
-
-
+    
+    
 def focal_loss(logits, target, weights=None, n=2):
     c = logits.shape[1]
     x = logits.permute(0, *range(2, logits.ndim), 1).reshape(-1, c)
@@ -71,71 +110,3 @@ def focal_loss(logits, target, weights=None, n=2):
 
     loss = focal_term * ce
     return loss.view(-1, 200, 200)
-
-
-def focal_loss_o(logits, target, weights=None, n=2):
-    target = target.argmax(dim=1)
-    log_p = F.log_softmax(logits, dim=1)
-
-    ce = F.nll_loss(log_p, target, weight=weights, reduction='none')
-
-    log_pt = log_p.gather(1, target[None])
-    pt = log_pt.exp()
-    loss = ce * (1 - pt + 1e-8) ** n
-
-    return loss
-
-
-def uce_loss(alpha, y, weights=None):
-    S = torch.sum(alpha, dim=1, keepdim=True)
-    B = y * (torch.digamma(S) - torch.digamma(alpha) + 1e-10)
-
-    if weights is not None:
-        B *= weights.view(1, -1, 1, 1)
-
-    A = torch.sum(B, dim=1, keepdim=True)
-
-    return A
-
-
-def u_focal_loss(alpha, y, weights=None, n=2):
-    S = torch.sum(alpha, dim=1, keepdim=True)
-
-    a0 = S
-    aj = torch.gather(alpha, 1, torch.argmax(y, dim=1, keepdim=True))
-
-    B = y * torch.exp((torch.lgamma(a0 - aj + n) + torch.lgamma(a0)) -
-                      (torch.lgamma(a0 + n) + torch.lgamma(a0 - aj))) * (torch.digamma(a0 + n) - torch.digamma(aj))
-
-    if weights is not None:
-        B *= weights.view(1, -1, 1, 1)
-
-    A = torch.sum(B, dim=1, keepdim=True)
-
-    return A
-
-
-def entropy_reg(alpha, beta_reg=.001):
-    alpha = alpha.permute(0, 2, 3, 1)
-
-    reg = D.Dirichlet(alpha).entropy().unsqueeze(1)
-
-    return -beta_reg * reg
-
-
-def ood_reg(alpha, ood):
-    if ood.long().sum() == 0:
-        return 0
-
-    alpha = alpha.permute(0, 2, 3, 1)
-
-    alpha_d = D.Dirichlet(alpha)
-    target_d = D.Dirichlet(torch.ones_like(alpha))
-
-    reg = D.kl.kl_divergence(alpha_d, target_d).unsqueeze(1)
-
-    return reg[ood.bool()].mean()
-
-
-def gamma(x):
-    return torch.exp(torch.lgamma(x))

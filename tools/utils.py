@@ -2,157 +2,82 @@ import os
 import subprocess
 
 import cv2
-import matplotlib.pyplot as plt
-import numpy as np
+
 import torch
 import yaml
 import pynvml
+import numpy as np
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+import torch.nn.functional as F
 
-from datasets.carla import compile_data as compile_data_carla
 from datasets.nuscenes import compile_data as compile_data_nuscenes
-
-from models.baseline import Baseline
-from models.evidential import Evidential
-from models.ensemble import Ensemble
-from models.dropout import Dropout
-from models.postnet import Postnet
-
-
-colors = torch.tensor([
-    [0, 0, 255],
-    [255, 0, 0],
-    [0, 255, 0],
-    [0, 0, 0],
-])
-
-models = {
-    'baseline': Baseline,
-    'evidential': Evidential,
-    'ensemble': Ensemble,
-    'dropout': Dropout,
-    'postnet': Postnet,
-}
 
 datasets = {
     'nuscenes': compile_data_nuscenes,
-    'carla': compile_data_carla,
 }
-
-n_classes, classes = 2, ["vehicle", "background"]
-weights = torch.tensor([2, 1])
-
-
-def change_params(config):
-    global classes, n_classes, weights
-
-    if config['pos_class'] == 'vehicle':
-        n_classes, classes = 2, ["vehicle", "background"]
-        weights = torch.tensor([2., 1.])
-    elif config['pos_class'] == 'road':
-        n_classes, classes = 2, ["road", "background"]
-        weights = torch.tensor([1., 1.])
-    elif config['pos_class'] == 'lane':
-        n_classes, classes = 2, ["lane", "background"]
-        weights = torch.tensor([5., 1.])
-    elif config['pos_class'] == 'all':
-        n_classes, classes = 4, ["vehicle", "road", "lane", "background"]
-        weights = torch.tensor([3., 1., 2., 1.])
-    else:
-        raise NotImplementedError("Invalid Positive Class")
-
-    return classes, n_classes, weights
 
 
 @torch.no_grad()
-def run_loader(model, loader):
+def run_loader(model, loader, config):
     predictions = []
-    seg_preds = []
     ground_truth = []
-    seg_labels = []
-    oods = []
-    aleatoric = []
-    epistemic = []
-    raw = []
 
     with torch.no_grad():
-        for images, segs, depths, intrinsics, extrinsics, labels, ood in tqdm(loader, desc="Running validation"):
-
-            outs, seg_outs, depths = model.forward(images, intrinsics, extrinsics)
-            outs = outs.detach().cpu()
-
-            if model.use_seg:
-                seg_outs = seg_outs.detach().cpu()
-                seg_preds.append(model.activate(seg_outs))
+        for images, segs, depths, intrinsics, extrinsics, labels in tqdm(loader, desc="Running validation"):
+            if config['gt_depth']:
+                b, c = depths.shape[:2]
+                depths[depths == -1] = 0
+                gt_depth = F.one_hot(depths, num_classes=112).permute(0, 1, 4, 2, 3)
+                gt_depth = gt_depth.view(b * c, 112, 28, 60)
             else:
-                seg_preds.append(torch.zeros((1, 1, 1)))
+                gt_depth = None
+
+            outs, seg_outs, depths = model.forward(images, intrinsics, extrinsics, gt_depth=gt_depth)
+            outs = outs.detach().cpu()
 
             predictions.append(model.activate(outs))
             ground_truth.append(labels)
-            seg_labels.append(segs)
-            oods.append(ood)
-            aleatoric.append(model.aleatoric(outs))
-            epistemic.append(model.epistemic(outs))
-            raw.append(outs)
 
     return (torch.cat(predictions, dim=0),
-            torch.cat(seg_preds, dim=0),
-            torch.cat(ground_truth, dim=0),
-            torch.cat(seg_labels, dim=0),
-            torch.cat(oods, dim=0),
-            torch.cat(aleatoric, dim=0),
-            torch.cat(epistemic, dim=0),
-            torch.cat(raw, dim=0))
+            torch.cat(ground_truth, dim=0))
 
 
-def map_rgb(onehot, ego=False):
-    dense = onehot.permute(1, 2, 0).detach().cpu().numpy().argmax(-1)
-
-    rgb = np.zeros((*dense.shape, 3))
-    for label, color in enumerate(colors):
-        rgb[dense == label] = color
-
-    if ego:
-        rgb[94:106, 98:102] = (0, 255, 255)
-
-    return rgb
+def save_pred(pred, label, out_path):
+    cv2.imwrite(os.path.join(out_path, "pred.png"), pred[0, 0].detach().cpu().numpy() * 255)
+    cv2.imwrite(os.path.join(out_path, "label.png"), label[0, 0].detach().cpu().numpy() * 255)
 
 
-def save_unc(u_score, u_true, out_path, score_name, true_name):
-    u_score = u_score.detach().cpu().numpy()
-    u_true = u_true.numpy()
-
-    cv2.imwrite(
-        os.path.join(out_path, true_name),
-        u_true[0, 0] * 255
-    )
-
-    cv2.imwrite(
-        os.path.join(out_path, score_name),
-        cv2.cvtColor((plt.cm.inferno(u_score[0, 0]) * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-    )
-
-
-def save_pred(pred, label, out_path, ego=False):
-    if pred.shape[1] != 2:
-        pred = map_rgb(pred[0], ego=ego)
-        label = map_rgb(label[0], ego=ego)
-        cv2.imwrite(os.path.join(out_path, "pred.png"), pred)
-        cv2.imwrite(os.path.join(out_path, "label.png"), label)
-
-        return pred, label
-    else:
-        cv2.imwrite(os.path.join(out_path, "pred.png"), pred[0, 0].detach().cpu().numpy() * 255)
-        cv2.imwrite(os.path.join(out_path, "label.png"), label[0, 0].detach().cpu().numpy() * 255)
+def apply_colormap_and_save(image_tensor, colormap, scale, output_file):
+    # Normalize and apply colormap
+    image_array = image_tensor.detach().cpu().numpy()
+    normalized_image = (scale * image_array).astype(np.uint8)
+    colored_image = colormap(normalized_image)
+    # Convert from RGBA to RGB (if necessary)
+    if colored_image.shape[-1] == 4:
+        colored_image = colored_image[..., :3]
+    # Convert to uint8
+    final_image = (colored_image * 255).astype(np.uint8)
+    # Save image using OpenCV
+    cv2.imwrite(output_file, cv2.cvtColor(final_image, cv2.COLOR_RGB2BGR))
 
 
-def get_mis(pred, label):
-    return (pred.argmax(dim=1) != label.argmax(dim=1)).unsqueeze(1)
+def save_dep(depth, label, out_path):
+    colormap = plt.cm.get_cmap('jet')
+    scale = 255 / 40  # Assuming the depth values are to be scaled by this factor
+
+    depth_image = depth[0].argmax(dim=0)
+    label_image = label[0, 0]
+
+    depth_file_path = os.path.join(out_path, "depth_pred.png")
+    label_file_path = os.path.join(out_path, "depth_label.png")
+
+    apply_colormap_and_save(depth_image, colormap, scale, depth_file_path)
+    apply_colormap_and_save(label_image, colormap, scale, label_file_path)
 
 
 def get_config(args):
-    with open(args.config, 'r') as file:
-        config = yaml.safe_load(file)
+    config = {}
 
     for key, value in vars(args).items():
         if value is not None:

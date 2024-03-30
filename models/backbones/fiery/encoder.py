@@ -90,7 +90,8 @@ class Encoder(nn.Module):
 
         x = self.depth_layer(x)
 
-        depth = x[:, : self.D].softmax(dim=1)
-        x = depth.unsqueeze(1) * x[:, self.D : (self.D + self.C)].unsqueeze(2)
+        depth = x[:, :self.D].softmax(dim=1)
+
+        x = depth.unsqueeze(1) * x[:, self.D:(self.D + self.C)].unsqueeze(2)
 
         return x, depth
